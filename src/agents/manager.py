@@ -46,6 +46,9 @@ class AgentManager:
         agent_type: str = "phase",
         use_existing_worktree: bool = False,
         commit_sha: Optional[str] = None,
+        phase_cli_tool: Optional[str] = None,
+        phase_cli_model: Optional[str] = None,
+        phase_glm_token_env: Optional[str] = None,
     ) -> Agent:
         """Create an agent for a specific task.
 
@@ -59,12 +62,16 @@ class AgentManager:
             agent_type: Type of agent (phase, validator, result_validator, monitor)
             use_existing_worktree: If True, use working_directory as-is without creating new worktree
             commit_sha: Specific commit to create worktree from (for validators)
+            phase_cli_tool: Per-phase CLI tool override (falls back to cli_type or global default)
+            phase_cli_model: Per-phase CLI model override (falls back to global default)
+            phase_glm_token_env: Per-phase GLM token env variable override (falls back to global default)
 
         Returns:
             Created agent
         """
         agent_id = str(uuid.uuid4())
-        cli_type = cli_type or self.config.default_cli_tool
+        # Use phase config with fallback to global defaults
+        cli_type = phase_cli_tool or cli_type or self.config.default_cli_tool
 
         logger.info(f"Creating {cli_type} agent {agent_id} for task {task.id}")
 
@@ -130,10 +137,11 @@ class AgentManager:
 
             # 3. Prepare environment variables for GLM if needed
             env_vars = None
-            model = getattr(self.config, 'cli_model', 'sonnet')
+            # Use phase config with fallback to global defaults
+            model = phase_cli_model or getattr(self.config, 'cli_model', 'sonnet')
             if 'GLM' in model.upper():
                 import os
-                token_env_var = getattr(self.config, 'glm_api_token_env', 'GLM_API_TOKEN')
+                token_env_var = phase_glm_token_env or getattr(self.config, 'glm_api_token_env', 'GLM_API_TOKEN')
                 token = os.getenv(token_env_var)
 
                 if token:
@@ -203,6 +211,7 @@ class AgentManager:
             launch_command = cli_agent.get_launch_command(
                 system_prompt=system_prompt,
                 task_id=task.id,
+                model=model,  # Pass phase-specific or global model
             )
 
             # Send launch command to tmux
@@ -417,14 +426,34 @@ class AgentManager:
         # Use the actual worktree path for the agent
         cwd_info = f"Working Directory: {worktree_path}" if worktree_path else ""
 
+        # Get workflow information for context
+        workflow_id = getattr(task, 'workflow_id', None) or ""
+        workflow_description = ""
+        if workflow_id and self.phase_manager:
+            try:
+                workflow = self.phase_manager.get_workflow(workflow_id)
+                if workflow:
+                    workflow_description = workflow.description or ""
+            except Exception as e:
+                logger.warning(f"Could not get workflow description: {e}")
+
         base_message = f"""
 === TASK ASSIGNMENT ===
 🔑 Your Agent ID: {agent_id}
    ⚠️  CRITICAL: Use this EXACT ID when calling MCP tools (update_task_status, create_task, etc.)
    ⚠️  DO NOT use 'agent-mcp' or any other placeholder - it will fail authorization!
 
-Task ID: {task.id}
-{cwd_info}
+📋 Task ID: {task.id}
+🔄 Workflow ID: {workflow_id if workflow_id else "N/A (standalone task)"}
+📁 {cwd_info}
+
+⚠️ CRITICAL WORKFLOW INFORMATION:
+When using MCP tools, you MUST include:
+- agent_id: {agent_id}
+- workflow_id: {workflow_id if workflow_id else "N/A"}
+
+This ensures your work stays within this workflow execution.
+All tasks and tickets you create must use workflow_id: {workflow_id if workflow_id else "N/A"}
 """
 
         logger.info(f"🔍 PROMPT SIZE DEBUG: Base message length: {len(base_message)} chars")
@@ -433,6 +462,11 @@ Task ID: {task.id}
         phase_context_section = ""
         if hasattr(task, 'phase_id') and task.phase_id:
             base_message += f"\nPhase ID: {task.phase_id}"
+
+            # Add workflow description if available
+            if workflow_description:
+                base_message += f"\n\n=== WORKFLOW CONTEXT ===\nWorkflow ID: {workflow_id}\nWorkflow Description: {workflow_description}\n"
+
             logger.info(f"=== PHASE CONTEXT DEBUG for task {task.id} ===")
             logger.info(f"Task has phase_id: {task.phase_id}")
 

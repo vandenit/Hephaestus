@@ -362,14 +362,22 @@ class FrontendAPI:
         finally:
             session.close()
 
-    async def get_graph_data(self) -> Dict[str, Any]:
+    async def get_graph_data(self, workflow_id: Optional[str] = None) -> Dict[str, Any]:
         """Get graph data for visualization."""
         session = self.db_manager.get_session()
         try:
-            # Get all tasks and agents
-            tasks = session.query(Task).all()
-            agents = session.query(Agent).all()
-            phases = session.query(Phase).all()
+            # Get tasks filtered by workflow_id if provided
+            if workflow_id:
+                tasks = session.query(Task).filter(Task.workflow_id == workflow_id).all()
+                phases = session.query(Phase).filter(Phase.workflow_id == workflow_id).all()
+                # Get agents that are assigned to tasks in this workflow
+                agent_ids = set(t.assigned_agent_id for t in tasks if t.assigned_agent_id)
+                agent_ids.update(t.created_by_agent_id for t in tasks if t.created_by_agent_id)
+                agents = session.query(Agent).filter(Agent.id.in_(agent_ids)).all() if agent_ids else []
+            else:
+                tasks = session.query(Task).all()
+                agents = session.query(Agent).all()
+                phases = session.query(Phase).all()
 
             # Build nodes
             nodes = []
@@ -468,7 +476,7 @@ class FrontendAPI:
                         "type": "assigned",
                     })
 
-            # Parent-child task edges
+            # Parent-child task edges (based on parent_task_id)
             for task in tasks:
                 if task.parent_task_id:
                     edges.append({
@@ -478,6 +486,25 @@ class FrontendAPI:
                         "label": "subtask",
                         "type": "subtask",
                     })
+
+            # Task spawning edges (tasks created by the agent assigned to execute another task)
+            # This captures the actual task hierarchy: if Task A is assigned to Agent X,
+            # and Agent X creates Task B, then A -> B (A spawned B)
+            task_ids = {task.id for task in tasks}
+            for task in tasks:
+                if task.assigned_agent_id:
+                    # Find tasks created by this task's assigned agent
+                    for other_task in tasks:
+                        if (other_task.created_by_agent_id == task.assigned_agent_id
+                            and other_task.id != task.id
+                            and other_task.id in task_ids):
+                            edges.append({
+                                "id": f"edge_spawned_{task.id}_{other_task.id}",
+                                "source": f"task_{task.id}",
+                                "target": f"task_{other_task.id}",
+                                "label": "spawned",
+                                "type": "subtask",
+                            })
 
             # Create phase mapping - include both UUID and numeric keys
             phase_info = {}
@@ -577,7 +604,12 @@ class FrontendAPI:
                     "total_tasks": total_tasks,
                     "completed_tasks": completed_tasks,
                     "active_tasks": active_tasks,
-                    "pending_tasks": pending_tasks
+                    "pending_tasks": pending_tasks,
+                    "cli_config": {
+                        "cli_tool": phase.cli_tool,
+                        "cli_model": phase.cli_model,
+                        "glm_api_token_env": phase.glm_api_token_env
+                    }
                 })
 
             return {
@@ -596,7 +628,7 @@ class FrontendAPI:
         return workflow_info.get("phases", [])
 
     async def get_phase_details(self, phase_id: str) -> Dict[str, Any]:
-        """Get detailed phase information from YAML files."""
+        """Get detailed phase information from database."""
         session = self.db_manager.get_session()
         try:
             # Get the phase from database
@@ -604,40 +636,13 @@ class FrontendAPI:
             if not phase:
                 raise HTTPException(status_code=404, detail="Phase not found")
 
-            # Get the workflow to find the phases folder path
-            workflow = session.query(Workflow).filter_by(id=phase.workflow_id).first()
-            if workflow and workflow.phases_folder_path:
-                try:
-                    import yaml
-                    import os
-
-                    # Construct the YAML filename based on phase order and name
-                    yaml_file = os.path.join(
-                        workflow.phases_folder_path,
-                        f"{phase.order:02d}_{phase.name.lower().replace(' ', '_')}.yaml"
-                    )
-
-                    if os.path.exists(yaml_file):
-                        with open(yaml_file, 'r') as f:
-                            yaml_content = yaml.safe_load(f)
-
-                        return {
-                            "description": yaml_content.get("description", ""),
-                            "done_definitions": yaml_content.get("Done_Definitions", []),
-                            "additional_notes": yaml_content.get("Additional_Notes", ""),
-                            "outputs": yaml_content.get("Outputs", ""),
-                            "next_steps": yaml_content.get("Next_Steps", "")
-                        }
-                except Exception as e:
-                    logger.warning(f"Could not load YAML for phase {phase_id}: {e}")
-
-            # Fallback to basic phase information
+            # Return phase details directly from database
             return {
                 "description": phase.description or "",
-                "done_definitions": [],
-                "additional_notes": "No additional configuration available",
-                "outputs": "Standard phase outputs",
-                "next_steps": "Proceed to next phase when complete"
+                "done_definitions": phase.done_definitions or [],
+                "additional_notes": phase.additional_notes or "",
+                "outputs": phase.outputs or "",
+                "next_steps": phase.next_steps or ""
             }
         finally:
             session.close()
@@ -858,6 +863,7 @@ class FrontendAPI:
                 "runtime_seconds": runtime_seconds,
                 "system_prompt": system_prompt,
                 "user_prompt": task.enriched_description or task.raw_description,
+                "workflow_id": task.workflow_id,
                 "phase_info": phase_info,
                 "agent_info": agent_info,
                 "parent_task": parent_task,
@@ -1539,9 +1545,9 @@ def create_frontend_routes(db_manager: DatabaseManager, agent_manager: AgentMana
         return await frontend_api.get_memories(skip, limit, memory_type, search)
 
     @router.get("/graph")
-    async def get_graph_data():
+    async def get_graph_data(workflow_id: Optional[str] = None):
         """Get graph visualization data."""
-        return await frontend_api.get_graph_data()
+        return await frontend_api.get_graph_data(workflow_id=workflow_id)
 
     @router.get("/workflow")
     async def get_workflow():
